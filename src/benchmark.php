@@ -5,10 +5,22 @@ declare(strict_types=1);
 namespace Prooph\EventStoreBenchmarks;
 
 use Dotenv\Dotenv;
+use Prooph\Common\Messaging\FQCNMessageFactory;
 use Prooph\Common\Messaging\Message;
+use Prooph\EventSourcing\Aggregate\AggregateType;
+use Prooph\EventSourcing\AggregateChanged;
+use Prooph\EventSourcing\EventStoreIntegration\AggregateRootDecorator;
+use Prooph\EventSourcing\EventStoreIntegration\AggregateTranslator;
 use Prooph\EventStore\EventStore;
+use Prooph\EventStore\Exception\ConcurrencyException;
+use Prooph\EventStore\Exception\StreamExistsAlready;
 use Prooph\EventStore\Exception\StreamNotFound;
+use Prooph\EventStore\Metadata\FieldType;
+use Prooph\EventStore\Metadata\MetadataMatcher;
+use Prooph\EventStore\Metadata\Operator;
 use Prooph\EventStore\Pdo\Exception\RuntimeException;
+use Prooph\EventStore\Pdo\PersistenceStrategy\PostgresSingleStreamStrategy;
+use Prooph\EventStore\Pdo\PostgresEventStore;
 use Prooph\EventStore\Projection\ProjectionManager;
 use Prooph\EventStore\Stream;
 use Prooph\EventStore\StreamName;
@@ -314,6 +326,107 @@ foreach ($connections as $driver => $connection) {
     $avgReaders = 25000 / ($endProjectors - $startProjectors);
     echo "$driver avg writes $avgWriters events/second\n";
     echo "$driver avg reads $avgReaders events/second\n\n";
+}
+
+// revert patching of pdo-event-store projector
+file_put_contents($filename, $content);
+file_put_contents($filenameArangoDbEventStore, $contentArangoDbEventStore);
+file_put_contents($filenameConnectionOptions, $contentConnectionOptions);
+
+echo "all finished\n";
+
+// test 7 - real world test
+
+test8:
+
+echo "test 8 concurrency test (postgres only)\n\n";
+
+// loading classes for pthreads
+$autoloader->loadClass(StreamExistsAlready::class);
+$autoloader->loadClass(User::class);
+$autoloader->loadClass(UserRepository::class);
+$autoloader->loadClass(AggregateType::class);
+$autoloader->loadClass(AggregateTranslator::class);
+$autoloader->loadClass(AggregateRootDecorator::class);
+$autoloader->loadClass(MetadataMatcher::class);
+$autoloader->loadClass(Operator::class);
+$autoloader->loadClass(FieldType::class);
+$autoloader->loadClass(AggregateChanged::class);
+$autoloader->loadClass(ConcurrencyException::class);
+
+foreach ($connections as $name => $connection) {
+    echo "$name: destroying event-store tables on database $dbNames[$name]\n";
+    destroyDatabase($connection, $name,  $dbNames[$name]);
+    echo "$name: set up event store tables on database $dbNames[$name]\n";
+    createDatabase($connection, $name,  $dbNames[$name]);
+}
+
+echo "\n";
+
+foreach ($connections as $driver => $connection) {
+    echo "starting benchmarks for $driver\n\n";
+
+    $connection = createConnection($driver);
+    $eventStore = new PostgresEventStore(
+        new FQCNMessageFactory(),
+        $connection,
+        new PostgresSingleStreamStrategy()
+    );
+    $eventStore->create(new Stream(new StreamName('event_stream'), new \ArrayIterator([])));
+
+    $repo = new UserRepository($eventStore, AggregateType::fromAggregateRootClass(User::class), new AggregateTranslator());
+
+    $user = User::create();
+    $repo->saveAggregateRoot($user);
+
+
+    $writers = [];
+
+    for ($i = 0; $i < 10; $i++) {
+        $writers[] = new EventProducer($driver, 50);
+        $writers[] = new EventProducer($driver, 50);
+        $writers[] = new EventProducer($driver, 50);
+        $writers[] = new EventProducer($driver, 50);
+        $writers[] = new EventProducer($driver, 50);
+        $writers[] = new EventProducer($driver, 50);
+        $writers[] = new EventProducer($driver, 50);
+        $writers[] = new EventProducer($driver, 50);
+        $writers[] = new EventProducer($driver, 50);
+    }
+
+    foreach ($writers as $writer) {
+        $writer->start();
+    }
+
+    foreach ($writers as $writer) {
+        $writer->join();
+    }
+
+    $eventStoreTable = '_' . sha1('event_stream');
+
+    $eventsCount = $connection->query("SELECT COUNT(no) FROM $eventStoreTable")->fetchColumn();
+    $maxNo       = $connection->query("SELECT MAX(no) FROM $eventStoreTable")->fetchColumn();
+
+    echo "Events count: $eventsCount\n";
+    echo "Max no: $maxNo\n";
+
+    $projectionManager = createProjectionManager($eventStore, $driver, $connection);
+    $projection = $projectionManager->createProjection('test_projection');
+    $projection
+        ->init(function (): array {
+            return ['count' => 0];
+        })
+        ->fromStream('event_stream')
+        ->whenAny(function (array $state, Message $event): array {
+            $state['count']++;
+
+            return $state;
+        });
+
+    $projection->run(false);
+
+    $position       = $connection->query("SELECT position from projections")->fetchColumn();
+    echo "Position: $position\n";
 }
 
 // revert patching of pdo-event-store projector
